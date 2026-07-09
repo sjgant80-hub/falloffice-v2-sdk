@@ -1,0 +1,917 @@
+// falloffice-v2 SDK · sovereign single-file library · MIT · AI-Native Solutions
+// Extracted from falloffice-v2/index.html · 77624 bytes of source logic
+// Public-safe: no primes/glyphs/dyad references
+
+/*!
+ * Fall Kit · v1.0.0 · the shared cascade for every estate seed
+ *
+ * Inlineable JS module. Drop into any seed via <script> or copy-paste inline.
+ * Preserves single-HTML sovereignty (no external deps until user opts in to T2 WebLLM).
+ *
+ * What it gives every seed:
+ *  - AI tier picker: T0 (off · default) · T2 (WebLLM in-browser, 5 models 1B-70B) · T3 (BYOK Anthropic/OpenAI/Google)
+ *  - Universal entry: FallKit.aiComplete(systemPrompt, userMsg, maxTokens) → string|null
+ *  - AI chip UI in header
+ *  - WebRTC P2P mesh (ported from canonical fallnet · fall-signal channel · Google STUN)
+ *  - Help section partial: FallKit.helpSection()
+ *  - Settings panel: FallKit.openSettings()
+ *
+ * Doctrine (per botler CLAUDE.md):
+ *  - T0 fallback ALWAYS works · aiComplete returns null · caller MUST degrade gracefully
+ *  - NEVER hide a feature behind AI · NEVER proxy API keys · NEVER log keys
+ *  - WebLLM is lazy-loaded · model weights download ONLY on user opt-in
+ *
+ * Estate-first canonical references:
+ *  - WebLLM pattern: Downloads/botler/index.html (T0/T2/T3 cascade)
+ *  - WebRTC pattern: Downloads/fallnet/fallnet-shim.js (raw RTCPeerConnection)
+ *  - Mesh channel:   'fall-signal'
+ */
+(function (root) {
+  'use strict';
+  const FALL_KIT_VERSION = '1.2.0';
+  const KCC_MINT_URL = 'https://sjgant80-hub.github.io/kcc-mint/';
+  // ─── Model registry ──────────────────────────────────────────────
+  const WEBLLM_MODELS = {
+    'llama-1b':  { id: 'Llama-3.2-1B-Instruct-q4f16_1-MLC',   size: '~700MB', label: '1B · fast · any laptop / phone' },
+    'llama-3b':  { id: 'Llama-3.2-3B-Instruct-q4f16_1-MLC',   size: '~2GB',   label: '3B · balanced · default · most laptops' },
+    'qwen-7b':   { id: 'Qwen2.5-7B-Instruct-q4f16_1-MLC',     size: '~5GB',   label: '7B · capable · needs decent GPU (M-series Mac / 8GB+ VRAM)' },
+    'llama-8b':  { id: 'Llama-3.1-8B-Instruct-q4f16_1-MLC',   size: '~5GB',   label: '8B · common · needs decent GPU' },
+    'llama-70b': { id: 'Llama-3.1-70B-Instruct-q4f16_1-MLC',  size: '~40GB',  label: '70B · frontier · needs serious GPU + 64GB+ RAM' },
+  };
+  const DEFAULT_MODEL = 'llama-3b';
+  const T3_PROVIDERS = {
+    anthropic: { label: 'Anthropic Claude', models: ['claude-sonnet-4-5','claude-opus-4-7','claude-haiku-4-5'], default: 'claude-sonnet-4-5', url: 'https://api.anthropic.com/v1/messages' },
+    openai:    { label: 'OpenAI',           models: ['gpt-4o','gpt-4o-mini','o1-mini'],                          default: 'gpt-4o-mini',      url: 'https://api.openai.com/v1/chat/completions' },
+    google:    { label: 'Google Gemini',    models: ['gemini-1.5-pro','gemini-1.5-flash','gemini-2.0-flash-exp'], default: 'gemini-1.5-flash', url: 'https://generativelanguage.googleapis.com/v1beta/models/' },
+  };
+  // ─── State ───────────────────────────────────────────────────────
+  const STATE = {
+    config: loadConfig(),
+    ai: { ready: false, loading: false, progress: 0, engine: null, model: null },
+    mesh: { active: false, peers: new Map(), bc: null, signal: null },
+  };
+  function loadConfig() {
+    try { return JSON.parse(localStorage.getItem('fall-kit.config') || '{}'); }
+    catch (e) { return {}; }
+  }
+  function saveConfig() {
+    try { localStorage.setItem('fall-kit.config', JSON.stringify(STATE.config)); } catch (e) {}
+  }
+  // ─── DOM helpers ─────────────────────────────────────────────────
+  function $(s, root) { return (root || document).querySelector(s); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+  // ─── AI tier ─────────────────────────────────────────────────────
+  function aiTier() { return STATE.config.ai_tier || 'T0'; }
+  function renderAiChip() {
+    const chip = $('#fk-ai-chip');
+    if (!chip) return;
+    const txt = $('#fk-ai-chip-text');
+    chip.classList.remove('fk-chip-live', 'fk-chip-loading', 'fk-chip-warn');
+    const tier = aiTier();
+    if (tier === 'T0') { txt.textContent = 'T0 · off'; }
+    else if (tier === 'T2') {
+      if (STATE.ai.ready) { txt.textContent = 'T2 ' + (WEBLLM_MODELS[STATE.config.webllm_model || DEFAULT_MODEL]?.label.split(' · ')[0] || '') + ' · ready'; chip.classList.add('fk-chip-live'); }
+      else if (STATE.ai.loading) { txt.textContent = 'T2 loading ' + Math.round(STATE.ai.progress) + '%'; chip.classList.add('fk-chip-loading'); }
+      else { txt.textContent = 'T2 · click to load'; chip.classList.add('fk-chip-warn'); }
+    } else if (tier === 'T3') {
+      if (STATE.config.api_key) { txt.textContent = 'T3 ' + (T3_PROVIDERS[STATE.config.api_provider]?.label || 'BYOK') + ' · active'; chip.classList.add('fk-chip-live'); }
+      else { txt.textContent = 'T3 · no key set'; chip.classList.add('fk-chip-warn'); }
+    }
+  }
+  async function loadWebLLM(modelKey) {
+    if (STATE.ai.loading) return;
+    const key = modelKey || STATE.config.webllm_model || DEFAULT_MODEL;
+    const model = WEBLLM_MODELS[key];
+    if (!model) { console.error('fall-kit: unknown model', key); return; }
+    if (STATE.ai.ready && STATE.ai.model === model.id) return;
+    STATE.ai.loading = true; STATE.ai.progress = 0; renderAiChip();
+    notify('Loading WebLLM · ' + model.label + ' · ' + model.size + ' first time', 'info');
+    try {
+      const { CreateMLCEngine } = await import('https://esm.run/@mlc-ai/web-llm@0.2.79');
+      const engine = await CreateMLCEngine(model.id, {
+        initProgressCallback: p => { STATE.ai.progress = (p.progress || 0) * 100; renderAiChip(); }
+      });
+      STATE.ai.engine = engine;
+      STATE.ai.model = model.id;
+      STATE.ai.ready = true;
+      STATE.ai.loading = false;
+      STATE.config.webllm_model = key; saveConfig();
+      renderAiChip();
+      notify('WebLLM ready · sovereign mode · ' + model.label.split(' · ')[0], 'ok');
+    } catch (e) {
+      console.error('fall-kit: WebLLM load failed', e);
+      STATE.ai.loading = false; renderAiChip();
+      notify('WebLLM load failed · ' + e.message, 'err');
+    }
+  }
+  async function aiComplete(systemPrompt, userMsg, maxTokens) {
+    maxTokens = maxTokens || 600;
+    const tier = aiTier();
+    if (tier === 'T2' && STATE.ai.ready && STATE.ai.engine) {
+      const r = await STATE.ai.engine.chat.completions.create({
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMsg }],
+        max_tokens: maxTokens,
+      });
+      return r.choices[0].message.content;
+    }
+    if (tier === 'T3' && STATE.config.api_key && STATE.config.api_provider) {
+      return await aiCloudCall(systemPrompt, userMsg, maxTokens);
+    }
+    return null;
+  }
+  async function aiCloudCall(sys, msg, maxTokens) {
+    const provider = STATE.config.api_provider;
+    const key = STATE.config.api_key;
+    const model = STATE.config.api_model || T3_PROVIDERS[provider]?.default;
+    if (provider === 'anthropic') {
+      const r = await fetch(T3_PROVIDERS.anthropic.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model, max_tokens: maxTokens, system: sys, messages: [{ role: 'user', content: msg }] }),
+      });
+      if (!r.ok) throw new Error('Anthropic ' + r.status + ': ' + (await r.text()).slice(0, 200));
+      const j = await r.json();
+      return j.content[0].text;
+    }
+    if (provider === 'openai') {
+      const r = await fetch(T3_PROVIDERS.openai.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'Authorization': 'Bearer ' + key },
+        body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: 'system', content: sys }, { role: 'user', content: msg }] }),
+      });
+      if (!r.ok) throw new Error('OpenAI ' + r.status);
+      const j = await r.json();
+      return j.choices[0].message.content;
+    }
+    if (provider === 'google') {
+      const r = await fetch(T3_PROVIDERS.google.url + model + ':generateContent?key=' + encodeURIComponent(key), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: sys + '\n\n---\n\n' + msg }] }], generationConfig: { maxOutputTokens: maxTokens } }),
+      });
+      if (!r.ok) throw new Error('Google ' + r.status);
+      const j = await r.json();
+      return j.candidates[0].content.parts[0].text;
+    }
+    throw new Error('unknown provider: ' + provider);
+  }
+  // ─── WebRTC P2P mesh (ported from canonical fallnet · fall-signal channel · Google STUN) ───
+  const MESH_CHANNEL = 'fall-signal';
+  const STUN_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
+  function meshStart(opts) {
+    if (STATE.mesh.active) return;
+    opts = opts || {};
+    const seedId = opts.seedId || (location.pathname + '#' + Math.random().toString(36).slice(2, 8));
+    STATE.mesh.seedId = seedId;
+    try { STATE.mesh.bc = new BroadcastChannel(MESH_CHANNEL); }
+    catch (e) { console.warn('fall-kit: BroadcastChannel unavailable'); return; }
+    STATE.mesh.bc.onmessage = e => {
+      const m = e.data;
+      if (!m || !m.kind || m.peerId === seedId) return;
+      if (opts.onMessage) opts.onMessage(m);
+    };
+    STATE.mesh.bc.postMessage({ kind: 'fall-kit:hello', peerId: seedId, ts: Date.now(), seedName: opts.seedName || 'unknown' });
+    STATE.mesh.active = true;
+    notify('Mesh active · channel ' + MESH_CHANNEL, 'ok');
+  }
+  function meshPost(kind, payload) {
+    if (!STATE.mesh.active || !STATE.mesh.bc) return false;
+    STATE.mesh.bc.postMessage({ kind: kind, peerId: STATE.mesh.seedId, ts: Date.now(), payload: payload });
+    return true;
+  }
+  // ─── Toast ───────────────────────────────────────────────────────
+  function notify(msg, kind) {
+    let t = $('#fk-toast');
+    if (!t) {
+      t = document.createElement('div'); t.id = 'fk-toast';
+      t.style.cssText = 'position:fixed;bottom:18px;left:50%;transform:translateX(-50%) translateY(20px);background:#c08a3a;color:#0a0a0a;padding:9px 18px;border-radius:3px;font-family:ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;font-weight:700;opacity:0;transition:all .22s;z-index:10000;pointer-events:none';
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.style.background = kind === 'err' ? '#a14a2a' : kind === 'ok' ? '#6b8d4a' : '#c08a3a';
+    t.style.color = kind === 'err' ? '#fff' : '#0a0a0a';
+    t.style.opacity = '1';
+    t.style.transform = 'translateX(-50%) translateY(0)';
+    clearTimeout(t._to);
+    t._to = setTimeout(() => { t.style.opacity = '0'; t.style.transform = 'translateX(-50%) translateY(20px)'; }, 2400);
+  }
+  // ─── Settings modal ──────────────────────────────────────────────
+  function openSettings() {
+    let bg = $('#fk-modal-bg');
+    if (!bg) {
+      bg = document.createElement('div'); bg.id = 'fk-modal-bg';
+      bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;align-items:flex-start;justify-content:center;padding:60px 16px;overflow-y:auto;z-index:9999';
+      bg.onclick = e => { if (e.target.id === 'fk-modal-bg') closeSettings(); };
+      document.body.appendChild(bg);
+    }
+    const tier = aiTier();
+    const provider = STATE.config.api_provider || 'anthropic';
+    const providerCfg = T3_PROVIDERS[provider];
+    bg.innerHTML = `
+      <div style="background:#13121a;border:1px solid #c08a3a;border-radius:5px;max-width:600px;width:100%;padding:22px 24px;color:#ebe3d2;font-family:system-ui,-apple-system,sans-serif;font-size:13.5px;line-height:1.55">
+        <div style="margin-bottom:14px"><label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">Tier</label>
+          <select id="fk-tier" style="width:100%;padding:8px 11px;background:#1a1922;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13.5px;font-family:inherit">
+            <option value="T0"${tier==='T0'?' selected':''}>T0 · off (default · the seed works fully without AI)</option>
+            <option value="T2"${tier==='T2'?' selected':''}>T2 · WebLLM in-browser · sovereign · pick a model below</option>
+            <option value="T3"${tier==='T3'?' selected':''}>T3 · BYOK · Anthropic / OpenAI / Google · stored in your browser only</option>
+          </select>
+        </div>
+        <div id="fk-t2-block" style="display:${tier==='T2'?'block':'none'};margin-bottom:14px;padding:12px 14px;background:#1a1922;border:1px solid #2a2934;border-radius:4px">
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">WebLLM model · 1B → 70B cascade</label>
+          <select id="fk-model" style="width:100%;padding:8px 11px;background:#22212c;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13px;font-family:inherit">
+            ${Object.entries(WEBLLM_MODELS).map(([k,m]) => `<option value="${k}"${(STATE.config.webllm_model||DEFAULT_MODEL)===k?' selected':''}>${esc(m.label)} · ${esc(m.size)}</option>`).join('')}
+          </select>
+          <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <button id="fk-load-llm" style="padding:7px 14px;background:#c08a3a;color:#0a0a0a;border:none;border-radius:3px;font-weight:600;font-size:12px;cursor:pointer;font-family:inherit">${STATE.ai.ready?'✓ Loaded · switch':'Load model (one-time download)'}</button>
+            <span id="fk-llm-status" style="font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#a89e88;letter-spacing:.04em">${STATE.ai.ready?'ready':STATE.ai.loading?Math.round(STATE.ai.progress)+'%':'not loaded'}</span>
+          </div>
+          <div style="margin-top:8px;font-size:11px;color:#6e6a5e;line-height:1.55">First load downloads the model from @mlc-ai/web-llm CDN. Cached forever after. Inference is 100% local — open DevTools → Network during use, nothing leaves.</div>
+        </div>
+        <div id="fk-t3-block" style="display:${tier==='T3'?'block':'none'};margin-bottom:14px;padding:12px 14px;background:#1a1922;border:1px solid #2a2934;border-radius:4px">
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">BYOK provider</label>
+          <select id="fk-provider" style="width:100%;padding:8px 11px;background:#22212c;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13px;font-family:inherit;margin-bottom:10px">
+            ${Object.entries(T3_PROVIDERS).map(([k,p]) => `<option value="${k}"${provider===k?' selected':''}>${esc(p.label)}</option>`).join('')}
+          </select>
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">Model</label>
+          <select id="fk-api-model" style="width:100%;padding:8px 11px;background:#22212c;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13px;font-family:inherit;margin-bottom:10px">
+            ${providerCfg.models.map(m => `<option value="${m}"${(STATE.config.api_model||providerCfg.default)===m?' selected':''}>${esc(m)}</option>`).join('')}
+          </select>
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">API key</label>
+          <input type="password" id="fk-key" value="${esc(STATE.config.api_key || '')}" placeholder="${STATE.config.api_key ? '(set · leave empty to keep)' : 'sk-ant-... or sk-... or AIza...'}" autocomplete="off" style="width:100%;padding:8px 11px;background:#22212c;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13px;font-family:ui-monospace,Menlo,monospace">
+          <div style="margin-top:8px;font-size:11px;color:#6e6a5e;line-height:1.55">Key lives in this browser only (localStorage). Sent direct to the provider — never to us. Wipe with Reset.</div>
+        </div>
+        <div style="margin-bottom:14px;padding:12px 14px;background:#1a1922;border:1px solid #2a2934;border-radius:4px">
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">Cross-seed mesh</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button id="fk-mesh-toggle" style="padding:6px 12px;background:${STATE.mesh.active?'#6b8d4a':'#1a1922'};color:${STATE.mesh.active?'#fff':'#a89e88'};border:1px solid ${STATE.mesh.active?'#6b8d4a':'#3a342c'};border-radius:3px;font-size:11px;cursor:pointer;font-family:inherit">${STATE.mesh.active?'✓ Active · disconnect':'Activate mesh'}</button>
+            <span style="font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#6e6a5e;letter-spacing:.04em">channel · <code style="background:#22212c;padding:1px 5px;border-radius:2px">${MESH_CHANNEL}</code></span>
+          </div>
+          <div style="margin-top:8px;font-size:11px;color:#6e6a5e;line-height:1.55">BroadcastChannel for same-device · WebRTC for cross-device (planned). Other estate seeds on the same channel discover each other automatically.</div>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+          <button onclick="FallKit.closeSettings()" style="padding:7px 14px;background:transparent;color:#a89e88;border:1px solid #3a342c;border-radius:3px;font-size:12px;cursor:pointer;font-family:inherit">Close</button>
+          <button id="fk-save" style="padding:7px 14px;background:#c08a3a;color:#0a0a0a;border:none;border-radius:3px;font-weight:600;font-size:12px;cursor:pointer;font-family:inherit">Save</button>
+        </div>
+      </div>`;
+    // Wire interactions
+    $('#fk-tier').onchange = () => {
+      const t = $('#fk-tier').value;
+      $('#fk-t2-block').style.display = t === 'T2' ? 'block' : 'none';
+      $('#fk-t3-block').style.display = t === 'T3' ? 'block' : 'none';
+    };
+    $('#fk-provider') && ($('#fk-provider').onchange = () => {
+      const p = $('#fk-provider').value;
+      const sel = $('#fk-api-model');
+      sel.innerHTML = T3_PROVIDERS[p].models.map(m => `<option value="${m}">${esc(m)}</option>`).join('');
+    });
+    $('#fk-load-llm') && ($('#fk-load-llm').onclick = () => {
+      const m = $('#fk-model').value;
+      loadWebLLM(m);
+    });
+    $('#fk-mesh-toggle').onclick = () => {
+      if (STATE.mesh.active) { STATE.mesh.bc?.close(); STATE.mesh.active = false; STATE.mesh.bc = null; notify('Mesh disconnected'); }
+      else meshStart({ seedName: STATE.config.seedName || 'seed' });
+      openSettings();  // refresh modal
+    };
+    $('#fk-save').onclick = () => {
+      STATE.config.ai_tier = $('#fk-tier').value;
+      if ($('#fk-model')) STATE.config.webllm_model = $('#fk-model').value;
+      if ($('#fk-provider')) STATE.config.api_provider = $('#fk-provider').value;
+      if ($('#fk-api-model')) STATE.config.api_model = $('#fk-api-model').value;
+      const newKey = $('#fk-key')?.value;
+      if (newKey) STATE.config.api_key = newKey;
+      saveConfig(); renderAiChip(); notify('Saved', 'ok'); closeSettings();
+    };
+  }
+  function closeSettings() { const bg = $('#fk-modal-bg'); if (bg) bg.remove(); }
+  // ─── Help section (returns HTML string for inclusion in seed Help tabs) ───
+  function helpSection() {
+    return `<div style="background:rgba(192,138,58,.05);border:1px solid #3a342c;border-radius:4px;padding:18px 22px;margin:14px 0">
+      <p style="font-size:13px;color:#a89e88;line-height:1.7;margin-bottom:10px">This seed runs fully without AI (<strong style="color:#c08a3a">T0</strong>, default). Enable a tier in settings if you want AI-assist features:</p>
+      <table style="width:100%;border-collapse:collapse;font-size:12.5px">
+        <thead><tr><th style="padding:6px 10px;text-align:left;background:rgba(0,0,0,.2);font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#a89e88;letter-spacing:.08em;text-transform:uppercase">Tier</th><th style="padding:6px 10px;text-align:left;background:rgba(0,0,0,.2);font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#a89e88;letter-spacing:.08em;text-transform:uppercase">What it is</th></tr></thead>
+        <tbody>
+          <tr><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#c08a3a;font-weight:600">T0</td><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#a89e88">Off. The seed works fully. No AI · no downloads · no API calls.</td></tr>
+          <tr><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#c08a3a;font-weight:600">T2</td><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#a89e88">WebLLM in-browser. Pick a model: 1B (700MB, fast) → 3B (2GB, balanced) → 7B (5GB, capable) → 70B (40GB, frontier). One-time download, runs offline forever after. Zero data leaves your device.</td></tr>
+          <tr><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#c08a3a;font-weight:600">T3</td><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#a89e88">BYOK · Anthropic Claude · OpenAI GPT · Google Gemini. You bring the API key, you pay the provider direct. Key stays in your browser, sent direct to the provider, never proxied.</td></tr>
+        </tbody>
+      </table>
+      <p style="font-size:12px;color:#6e6a5e;line-height:1.6;margin-top:10px">Open the AI chip in the header to switch tier or check status. Cross-seed mesh activates a BroadcastChannel on <code style="background:#1a1922;padding:1px 5px;border-radius:2px">${MESH_CHANNEL}</code> so other estate seeds on the same device discover this one.</p>
+    </div>`;
+  }
+  // ─── CSS for AI chip ─────────────────────────────────────────────
+  function injectCss() {
+    const s = document.createElement('style');
+    s.id = 'fk-css';
+    s.textContent = `
+      #fk-ai-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 9px; border-radius:3px; font-family:ui-monospace,Menlo,monospace; font-size:10px; letter-spacing:.08em; text-transform:uppercase; font-weight:600; cursor:pointer; border:1px solid #3a342c; background:#1a1922; color:#a89e88; user-select:none; vertical-align:middle }
+      #fk-ai-chip:hover { border-color:#c08a3a; color:#ebe3d2 }
+      #fk-ai-chip.fk-chip-live { border-color:#6b8d4a; color:#6b8d4a; background:rgba(107,141,74,.10) }
+      #fk-ai-chip.fk-chip-loading { border-color:#e8a83a; color:#e8a83a; background:rgba(232,168,58,.10) }
+      #fk-ai-chip.fk-chip-warn { border-color:#a14a2a; color:#a14a2a; background:rgba(161,74,42,.08) }
+      #fk-ai-chip .fk-dot { width:6px; height:6px; border-radius:50%; background:currentColor; flex-shrink:0 }
+      #fk-ai-chip.fk-chip-loading .fk-dot { animation:fk-pulse 1s infinite }
+      @keyframes fk-pulse { 0%,100%{opacity:1}50%{opacity:.3} }
+      .fk-ai-assist { display:inline-flex; align-items:center; gap:5px; padding:4px 9px; font-size:11px; border:1px solid #c08a3a; color:#c08a3a; background:transparent; border-radius:3px; cursor:pointer; font-family:inherit }
+      .fk-ai-assist:hover { background:#c08a3a; color:#0a0a0a }
+      .fk-ai-assist::before { content:'✦'; font-size:12px }
+    `;
+    document.head.appendChild(s);
+  }
+  // ─── KCC Mint launcher (v1.2 · fork-this-seed shortcut) ──────────
+  function openMint() {
+    const slug = (STATE.config.seedName || location.hostname.split('.')[0] || 'seed').replace(/[^a-z0-9-]/gi, '-').toLowerCase();
+    const url = location.href.split('?')[0].split('#')[0];
+    const params = new URLSearchParams({ fork: '1', parent_slug: slug, parent_name: name, parent_url: url, parent_desc: desc });
+  }
+  // ─── Init ────────────────────────────────────────────────────────
+  function init(opts) {
+    opts = opts || {};
+    injectCss();
+    if (opts.seedName) STATE.config.seedName = opts.seedName;
+    if ($('#fk-ai-chip')) { renderAiChip(); return { version: FALL_KIT_VERSION, mounted: false }; }
+    const chip = document.createElement('button');
+    chip.id = 'fk-ai-chip';
+    chip.title = 'AI cascade · click to configure tier and model';
+    chip.innerHTML = '<span class="fk-dot"></span><span id="fk-ai-chip-text">T0 · off</span>';
+    chip.onclick = openSettings;
+    // Try anchor first, fall back to floating bottom-right
+    const anchor = opts.chipAnchor ? $(opts.chipAnchor) : null;
+    if (anchor) { anchor.appendChild(chip); }
+    else {
+      chip.style.cssText += ';position:fixed;bottom:14px;left:14px;z-index:9998;box-shadow:0 4px 14px rgba(0,0,0,.4)';
+      document.body.appendChild(chip);
+    }
+    // v1.2 · floating mint button next to chip
+    if (!$('#fk-mint-btn') && !opts.hideMint) {
+      const mintBtn = document.createElement('button');
+      mintBtn.id = 'fk-mint-btn';
+      mintBtn.title = 'Mint a fork of this seed as a KCC bundle · provenance economy';
+      mintBtn.innerHTML = '<span style="font-size:13px">✦</span> mint fork';
+      mintBtn.style.cssText = 'position:fixed;bottom:14px;left:130px;z-index:9998;display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border-radius:3px;font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;font-weight:600;cursor:pointer;border:1px solid #c08a3a;color:#c08a3a;background:rgba(10,10,15,.7);box-shadow:0 4px 14px rgba(0,0,0,.4)';
+      mintBtn.onmouseover = () => { mintBtn.style.background = '#c08a3a'; mintBtn.style.color = '#0a0a0a'; };
+      mintBtn.onmouseout  = () => { mintBtn.style.background = 'rgba(10,10,15,.7)'; mintBtn.style.color = '#c08a3a'; };
+      mintBtn.onclick = openMint;
+      document.body.appendChild(mintBtn);
+    }
+    renderAiChip();
+    return { version: FALL_KIT_VERSION, mounted: true };
+  }
+  // ─── Public API ──────────────────────────────────────────────────
+  root.FallKit = {
+    version: FALL_KIT_VERSION,
+    init: init,
+    aiTier: aiTier,
+    aiComplete: aiComplete,
+    loadWebLLM: loadWebLLM,
+    openSettings: openSettings,
+    closeSettings: closeSettings,
+    renderAiChip: renderAiChip,
+    helpSection: helpSection,
+    meshStart: meshStart,
+    meshPost: meshPost,
+    notify: notify,
+    openMint: openMint,  // v1.2 · launch kcc-mint with this seed prefilled as parent
+    MODELS: WEBLLM_MODELS,
+    PROVIDERS: T3_PROVIDERS,
+    state: STATE,
+  };
+})(typeof window !== 'undefined' ? window : globalThis);
+  // fall-kit init · auto-mounts a floating AI chip bottom-left
+  (function () {
+    function go() { if (typeof FallKit !== 'undefined') FallKit.init({ seedName: "falloffice-v2" }); }
+    else go();
+  })();
+'use strict';
+// ════════════════════════════════════════════════════════════════
+// FallOffice v2 · sovereign office suite
+// 7-app suite + Ω orchestrator · single HTML · prime 7 · MIT
+// ════════════════════════════════════════════════════════════════
+const VERSION='2.0.0';const PRIME=7;const STORE='falloffice-v2';
+const APPS=[
+  {id:'words',name:'Words',ico:'¶',hint:'documents'},
+  {id:'sheets',name:'Sheets',ico:'⊞',hint:'spreadsheets'},
+  {id:'slides',name:'Slides',ico:'❏',hint:'decks'},
+  {id:'mail',name:'Mail',ico:'✉',hint:'drafts'},
+  {id:'cal',name:'Calendar',ico:'☐',hint:'events'},
+  {id:'notes',name:'Notes',ico:'≡',hint:'markdown'},
+  {id:'tasks',name:'Tasks',ico:'✓',hint:'todos'}
+];
+let state={
+  active:'words',
+  words:{docs:[],activeId:null},
+  sheets:{books:[],activeId:null,activeCell:'A1'},
+  slides:{decks:[],activeId:null,activeIdx:0},
+  mail:{drafts:[],activeId:null},
+  cal:{events:[],year:null,month:null},
+  notes:{notes:[],activeId:null,filter:''},
+  tasks:{tasks:[],filter:'all'},
+  settings:{rateTier:'mid',anthropicKey:'',openaiKey:'',geminiKey:'',openrouterKey:''}
+};
+// ── util ──
+const $=(s,p=document)=>p.querySelector(s);
+const $$=(s,p=document)=>Array.from(p.querySelectorAll(s));
+const uid=()=>'_'+Math.random().toString(36).slice(2,11);
+const now=()=>Date.now();
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtDate=d=>{const x=new Date(d);return x.toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'})};
+const fmtDT=d=>{const x=new Date(d);return x.toLocaleString('en-GB',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})};
+function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');clearTimeout(t._to);t._to=setTimeout(()=>t.classList.remove('show'),1700)}
+// ── IDB ──
+let db;
+function openDB(){return new Promise((res,rej)=>{const r=indexedDB.open(STORE,1);r.onupgradeneeded=e=>{const d=e.target.result;if(!d.objectStoreNames.contains('s'))d.createObjectStore('s')};r.onsuccess=e=>{db=e.target.result;res(db)};r.onerror=rej})}
+async function saveAll(){if(!db)await openDB();return new Promise(res=>{const tx=db.transaction('s','readwrite');tx.objectStore('s').put(state,'state');tx.oncomplete=res})}
+async function loadAll(){if(!db)await openDB();return new Promise(res=>{const tx=db.transaction('s','readonly');const r=tx.objectStore('s').get('state');r.onsuccess=()=>{if(r.result){state=Object.assign(state,r.result);// re-merge sub-defaults if older state
+      ['words','sheets','slides','mail','cal','notes','tasks','settings'].forEach(k=>{state[k]=Object.assign({},getDefaults()[k],state[k]||{})})}res()}})}
+function getDefaults(){return{words:{docs:[],activeId:null},sheets:{books:[],activeId:null,activeCell:'A1'},slides:{decks:[],activeId:null,activeIdx:0},mail:{drafts:[],activeId:null},cal:{events:[],year:null,month:null},notes:{notes:[],activeId:null,filter:''},tasks:{tasks:[],filter:'all'},settings:{rateTier:'mid',anthropicKey:'',openaiKey:'',geminiKey:'',openrouterKey:''}}}
+// ── CASCADE (T0/T2/T3) ──
+const Cascade={
+  async detectTier(){if(await this._probe())return'T2';const s=state.settings;if(s.anthropicKey||s.openaiKey||s.geminiKey||s.openrouterKey)return'T3';return'T0'},
+  async _probe(){if(this._p!==undefined)return this._p;try{this._p=await Promise.race([fetch('http://127.0.0.1:11434/api/tags').then(r=>r.ok),new Promise(r=>setTimeout(()=>r(false),350))])}catch(e){this._p=false}return this._p},
+  async generate(sys,user,maxTok){const s=state.settings,max=maxTok||1200;
+    if(s.anthropicKey)try{const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':s.anthropicKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify({model:'claude-haiku-4-5',max_tokens:max,system:sys,messages:[{role:'user',content:user}]})});const d=await r.json();return{tier:'T3·Claude',text:d?.content?.[0]?.text||''}}catch(e){}
+    if(s.geminiKey)try{const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${s.geminiKey}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({systemInstruction:{parts:[{text:sys}]},contents:[{parts:[{text:user}]}]})});const d=await r.json();return{tier:'T3·Gemini',text:d?.candidates?.[0]?.content?.parts?.[0]?.text||''}}catch(e){}
+    if(s.openaiKey)try{const r=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+s.openaiKey},body:JSON.stringify({model:'gpt-4o-mini',messages:[{role:'system',content:sys},{role:'user',content:user}]})});const d=await r.json();return{tier:'T3·GPT',text:d?.choices?.[0]?.message?.content||''}}catch(e){}
+    if(s.openrouterKey)try{const r=await fetch('https://openrouter.ai/api/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+s.openrouterKey,'HTTP-Referer':location.origin},body:JSON.stringify({model:'anthropic/claude-haiku-4-5',messages:[{role:'system',content:sys},{role:'user',content:user}]})});const d=await r.json();return{tier:'T3·OpenRouter',text:d?.choices?.[0]?.message?.content||''}}catch(e){}
+    if(await this._probe())try{const r=await fetch('http://127.0.0.1:11434/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'llama3.2',prompt:sys+'\n\n'+user,stream:false})});const d=await r.json();return{tier:'T2·local',text:d?.response||''}}catch(e){}
+    return{tier:'T0',text:null}
+  }
+};
+async function updateTierBadge(){const t=await Cascade.detectTier();const el=$('#tierBadge');el.textContent=t==='T0'?'offline':t;el.classList.toggle('tier-t3',t!=='T0');$('#pTier').textContent=t==='T0'?'T0 · local':t}
+// ════════════════════════════════════════════════════════════════
+// Ω ORCHESTRATOR — autopilot router
+// ════════════════════════════════════════════════════════════════
+const ROUTES=[
+  {app:'words',verbs:/\b(draft|write|letter|memo|propos|quote|brief|doc|content|article|blog|notes? for|report)\b/i,hint:'document'},
+  {app:'sheets',verbs:/\b(spreadsheet|sheet|table|budget|expens|invoice list|track|calculator|p&l|cashflow)\b/i,hint:'spreadsheet'},
+  {app:'slides',verbs:/\b(deck|slides|presentation|pitch|talk|keynote)\b/i,hint:'deck'},
+  {app:'mail',verbs:/\b(email|mail|message|reach out|reply|follow.?up)\b/i,hint:'email'},
+  {app:'cal',verbs:/\b(meeting|appointment|schedule|book|calendar|event)\b/i,hint:'event'},
+  {app:'notes',verbs:/\b(note|jot|capture|idea|thought|remember)\b/i,hint:'note'},
+  {app:'tasks',verbs:/\b(todo|task|reminder|to.?do|chore|list)\b/i,hint:'task'}
+];
+async function omegaRoute(intent){
+  // T0 verb match
+  let app=null;
+  for(const r of ROUTES){if(r.verbs.test(intent)){app=r.app;break}}
+  // T3 sharpening
+  const tier=await Cascade.detectTier();
+  if(tier!=='T0'){
+    const sys='You are Ω, the orchestrator of the FallOffice suite. Apps available: words (documents), sheets (spreadsheets), slides (decks), mail (drafts), cal (calendar events), notes (markdown notes), tasks (todos). Return ONLY a JSON object: {"app":"<app id>","title":"<short title>","body":"<the content the user wants generated · markdown · concise>"}. The body MUST be the actual generated artefact, not a description of it.';
+    try{const r=await Cascade.generate(sys,intent,1400);const m=r.text?.match(/\{[\s\S]*\}/);if(m){const p=JSON.parse(m[0]);if(p.app&&APPS.find(a=>a.id===p.app))return{app:p.app,title:p.title||intent.slice(0,50),body:p.body||''}}}catch(e){}
+  }
+  if(!app)app='words';
+  return{app,title:intent.slice(0,50),body:''}
+}
+// ── command palette ──
+function openPalette(){$('#palette').classList.add('open');setTimeout(()=>$('#pInput').focus(),50);renderPaletteSuggestions('')}
+function closePalette(){$('#palette').classList.remove('open');$('#pInput').value=''}
+function renderPaletteSuggestions(q){
+  const body=$('#pBody');
+  if(!q.trim()){
+    body.innerHTML=APPS.map(a=>`<div class="palette-row" onclick="showApp('${a.id}');closePalette()"><div class="ico">${a.ico}</div><div><div>Open ${a.name}</div><div class="desc">${a.hint}</div></div></div>`).join('')+
+      `<div style="padding:10px 12px;font-family:var(--mono);font-size:10px;color:var(--cream-muted);letter-spacing:0.1em;text-transform:uppercase;border-top:1px dashed var(--line);margin-top:6px">or type · Ω will route + auto-fill</div>`;
+    return
+  }
+  // try predicted route
+  let pred=null;for(const r of ROUTES){if(r.verbs.test(q)){pred=APPS.find(a=>a.id===r.app);break}}
+  body.innerHTML=`<div class="palette-row sel" onclick="executeIntent()"><div class="ico">${pred?pred.ico:'Ω'}</div><div><div>${pred?'Create in '+pred.name:'Ω · route + auto-fill'}: ${esc(q.slice(0,80))}</div><div class="desc">enter · runs the autopilot (uses your model if a key is set)</div></div><div class="key">↵</div></div>`
+}
+async function executeIntent(){
+  const q=$('#pInput').value.trim();if(!q)return;
+  toast('Ω routing…');closePalette();
+  const r=await omegaRoute(q);
+  switch(r.app){
+    case'words':newDoc(r.title,r.body);break;
+    case'sheets':newSheet(r.title,r.body);break;
+    case'slides':newDeck(r.title,r.body);break;
+    case'mail':newDraft({subject:r.title,body:r.body});break;
+    case'cal':openModal('event');break;
+    case'notes':newNote({title:r.title,body:r.body});break;
+    case'tasks':addTask({title:r.title.replace(/^\s*(add|create|make|new)\s+/i,'')});break;
+  }
+  toast('done · Ω routed to '+r.app)
+}
+// ════════════════════════════════════════════════════════════════
+// APP: WORDS
+// ════════════════════════════════════════════════════════════════
+function viewWords(){
+  $('#view').innerHTML=`
+    <div class="view">
+      <div class="view-hd">
+        <div><h2>Words</h2><div class="sub">${state.words.docs.length} document${state.words.docs.length===1?'':'s'} · auto-saved to IndexedDB</div></div>
+        <div class="actions"><button class="btn primary" onclick="newDoc()">+ new doc</button></div>
+      </div>
+      <div class="layout">
+        <aside class="side" id="wordsSide"></aside>
+        <div class="pane" id="wordsPane"></div>
+      </div>
+    </div>`;
+  renderWordsSide();renderWordsPane();
+}
+function renderWordsSide(){
+  const docs=state.words.docs.slice().sort((a,b)=>b.updated-a.updated);
+  $('#wordsSide').innerHTML=docs.length?docs.map(d=>`<div class="item ${state.words.activeId===d.id?'active':''}" onclick="selectDoc('${d.id}')"><div>${esc(d.title||'untitled')}</div><div class="meta">${fmtDate(d.updated)}</div></div>`).join(''):'<div class="empty">no docs yet</div>';
+}
+function renderWordsPane(){
+  const d=state.words.docs.find(x=>x.id===state.words.activeId);
+  if(!d){$('#wordsPane').innerHTML='<div class="empty"><div class="big">¶</div>select a doc · or create one</div>';return}
+  $('#wordsPane').innerHTML=`
+    <div class="words-tool">
+      <input type="text" id="wTitle" value="${esc(d.title)}" placeholder="untitled" style="flex:1;min-width:180px">
+      <span class="sep"></span>
+      <button onclick="wCmd('bold')" title="bold"><b>B</b></button>
+      <button onclick="wCmd('italic')" title="italic"><i>I</i></button>
+      <button onclick="wCmd('underline')" title="underline"><u>U</u></button>
+      <span class="sep"></span>
+      <button onclick="wCmd('formatBlock','h1')">H1</button>
+      <button onclick="wCmd('formatBlock','h2')">H2</button>
+      <button onclick="wCmd('formatBlock','h3')">H3</button>
+      <button onclick="wCmd('formatBlock','p')">¶</button>
+      <span class="sep"></span>
+      <button onclick="wCmd('insertUnorderedList')">• list</button>
+      <button onclick="wCmd('insertOrderedList')">1. list</button>
+      <button onclick="wCmd('formatBlock','blockquote')">❝</button>
+      <span class="sep"></span>
+      <button onclick="wLink()">link</button>
+      <span class="sep"></span>
+      <button onclick="exportDoc('md')">↓ .md</button>
+      <button onclick="exportDoc('html')">↓ .html</button>
+      <button onclick="exportDoc('txt')">↓ .txt</button>
+      <span class="sep"></span>
+      <button onclick="deleteDoc()" style="color:var(--red)">×</button>
+    </div>
+    <div class="pane-bd" style="padding:0">
+      <div class="words-doc" id="wDoc" contenteditable="true" spellcheck="true">${d.html||'<p>start writing…</p>'}</div>
+    </div>`;
+  $('#wTitle').oninput=e=>{d.title=e.target.value;d.updated=now();saveAll();renderWordsSide()};
+  $('#wDoc').oninput=()=>{d.html=$('#wDoc').innerHTML;d.updated=now();clearTimeout(window._wsv);window._wsv=setTimeout(saveAll,400)};
+}
+function newDoc(title,bodyMd){const d={id:uid(),title:title||'untitled',html:bodyMd?mdToHtml(bodyMd):'<p></p>',created:now(),updated:now()};state.words.docs.push(d);state.words.activeId=d.id;state.active='words';saveAll();render();}
+function selectDoc(id){state.words.activeId=id;renderWordsSide();renderWordsPane()}
+function deleteDoc(){if(!confirm('delete this doc?'))return;state.words.docs=state.words.docs.filter(x=>x.id!==state.words.activeId);state.words.activeId=null;saveAll();renderWordsSide();renderWordsPane()}
+function wCmd(c,v){document.execCommand(c,false,v||null);$('#wDoc').focus()}
+function wLink(){const u=prompt('url:','https://');if(u)document.execCommand('createLink',false,u)}
+function exportDoc(fmt){const d=state.words.docs.find(x=>x.id===state.words.activeId);if(!d)return;let content,mime,ext;if(fmt==='md'){content=htmlToMd(d.html);mime='text/markdown';ext='md'}else if(fmt==='txt'){content=$('#wDoc').innerText;mime='text/plain';ext='txt'}else{content=`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(d.title)}</title><style>body{font-family:Georgia,serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.6;color:#222}h1,h2,h3{font-weight:600}</style></head><body><h1>${esc(d.title)}</h1>${d.html}</body></html>`;mime='text/html';ext='html'}downloadFile(`${slug(d.title)}.${ext}`,content,mime)}
+// minimal md ↔ html
+function mdToHtml(md){return md.split(/\n\n+/).map(p=>{p=p.trim();if(!p)return'';if(p.startsWith('# '))return'<h1>'+esc(p.slice(2))+'</h1>';if(p.startsWith('## '))return'<h2>'+esc(p.slice(3))+'</h2>';if(p.startsWith('### '))return'<h3>'+esc(p.slice(4))+'</h3>';if(p.startsWith('> '))return'<blockquote>'+esc(p.slice(2))+'</blockquote>';if(p.match(/^[-*]\s/m))return'<ul>'+p.split('\n').filter(l=>l.match(/^[-*]\s/)).map(l=>'<li>'+esc(l.replace(/^[-*]\s/,''))+'</li>').join('')+'</ul>';if(p.match(/^\d+\.\s/m))return'<ol>'+p.split('\n').filter(l=>l.match(/^\d+\.\s/)).map(l=>'<li>'+esc(l.replace(/^\d+\.\s/,''))+'</li>').join('')+'</ol>';return'<p>'+esc(p).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\*(.+?)\*/g,'<em>$1</em>').replace(/`(.+?)`/g,'<code>$1</code>')+'</p>'}).join('\n')}
+function htmlToMd(html){const t=document.createElement('div');t.innerHTML=html;function walk(n){if(n.nodeType===3)return n.textContent;if(n.nodeType!==1)return'';const c=Array.from(n.childNodes).map(walk).join('');const tag=n.nodeName.toLowerCase();if(tag==='h1')return'\n# '+c+'\n\n';if(tag==='h2')return'\n## '+c+'\n\n';if(tag==='h3')return'\n### '+c+'\n\n';if(tag==='strong'||tag==='b')return'**'+c+'**';if(tag==='em'||tag==='i')return'*'+c+'*';if(tag==='code')return'`'+c+'`';if(tag==='blockquote')return'\n> '+c+'\n\n';if(tag==='li')return'- '+c+'\n';if(tag==='ul'||tag==='ol')return'\n'+c+'\n';if(tag==='p'||tag==='div')return c+'\n\n';if(tag==='br')return'\n';if(tag==='a')return'['+c+']('+(n.getAttribute('href')||'')+')';return c}return walk(t).replace(/\n{3,}/g,'\n\n').trim()}
+// ════════════════════════════════════════════════════════════════
+// APP: SHEETS — formula engine
+// ════════════════════════════════════════════════════════════════
+const SHEET_COLS=10,SHEET_ROWS=30;
+function colName(i){return String.fromCharCode(65+i)}
+function viewSheets(){
+  $('#view').innerHTML=`
+    <div class="view">
+      <div class="view-hd">
+        <div><h2>Sheets</h2><div class="sub">${state.sheets.books.length} workbook${state.sheets.books.length===1?'':'s'} · formulas: SUM AVG MIN MAX COUNT IF ROUND ABS CONCAT</div></div>
+        <div class="actions"><button class="btn primary" onclick="newSheet()">+ new sheet</button></div>
+      </div>
+      <div class="layout">
+        <aside class="side" id="sheetsSide"></aside>
+        <div class="pane" id="sheetsPane"></div>
+      </div>
+    </div>`;
+  renderSheetsSide();renderSheetsPane();
+}
+function renderSheetsSide(){
+  const bs=state.sheets.books.slice().sort((a,b)=>b.updated-a.updated);
+  $('#sheetsSide').innerHTML=bs.length?bs.map(b=>`<div class="item ${state.sheets.activeId===b.id?'active':''}" onclick="selectSheet('${b.id}')"><div>${esc(b.title)}</div><div class="meta">${fmtDate(b.updated)}</div></div>`).join(''):'<div class="empty">no sheets yet</div>';
+}
+function renderSheetsPane(){
+  const b=state.sheets.books.find(x=>x.id===state.sheets.activeId);
+  if(!b){$('#sheetsPane').innerHTML='<div class="empty"><div class="big">⊞</div>select a sheet · or create one</div>';return}
+  const ref=state.sheets.activeCell||'A1';const raw=b.cells[ref]||'';
+  let header='<tr><th class="row-h"></th>';for(let c=0;c<SHEET_COLS;c++)header+=`<th>${colName(c)}</th>`;header+='</tr>';
+  let body='';for(let r=1;r<=SHEET_ROWS;r++){body+=`<tr><td class="row-h">${r}</td>`;for(let c=0;c<SHEET_COLS;c++){const k=colName(c)+r;const val=b.cells[k]||'';const disp=val.startsWith('=')?evalFormula(val,b.cells,new Set()):val;const isFormula=val.startsWith('=');const isErr=String(disp).startsWith('#');body+=`<td class="${isErr?'err':(isFormula?'formula':'')}"><input data-ref="${k}" value="${esc(disp)}" data-raw="${esc(val)}" onfocus="onCellFocus(this)" onblur="onCellBlur(this)"></td>`}body+='</tr>'}
+  $('#sheetsPane').innerHTML=`
+    <div class="pane-hd">
+      <input id="sTitle" value="${esc(b.title)}" style="flex:1;min-width:140px;font-family:var(--serif)">
+      <button class="btn sm" onclick="exportSheet('csv')">↓ csv</button>
+      <button class="btn sm" onclick="exportSheet('json')">↓ json</button>
+      <button class="btn sm danger" onclick="deleteSheet()">×</button>
+    </div>
+    <div class="sheet-fxbar">
+      <div class="cell-ref">${ref}</div>
+      <input id="sFx" value="${esc(raw)}" placeholder="value · or =SUM(A1:A10)">
+    </div>
+    <div class="sheet-wrap pane-bd" style="padding:0"><table class="sheet">${header}${body}</table></div>`;
+  $('#sTitle').oninput=e=>{b.title=e.target.value;b.updated=now();saveAll();renderSheetsSide()};
+  $('#sFx').onchange=e=>{const ref=state.sheets.activeCell;b.cells[ref]=e.target.value;b.updated=now();saveAll();renderSheetsPane()};
+}
+function onCellFocus(el){state.sheets.activeCell=el.dataset.ref;el.value=el.dataset.raw;$('.sheet-fxbar .cell-ref').textContent=el.dataset.ref;$('#sFx').value=el.dataset.raw}
+function onCellBlur(el){const b=state.sheets.books.find(x=>x.id===state.sheets.activeId);if(!b)return;const v=el.value;b.cells[el.dataset.ref]=v;el.dataset.raw=v;b.updated=now();saveAll();const disp=v.startsWith('=')?evalFormula(v,b.cells,new Set()):v;el.value=disp;el.parentElement.classList.toggle('formula',v.startsWith('='));el.parentElement.classList.toggle('err',String(disp).startsWith('#'));// recalc dependent cells
+  $$('.sheet input').forEach(i=>{const r=b.cells[i.dataset.ref]||'';if(r.startsWith('=')){const d=evalFormula(r,b.cells,new Set());i.value=d;i.parentElement.classList.toggle('err',String(d).startsWith('#'))}})}
+// formula evaluator
+function evalFormula(expr,cells,seen){
+  expr=expr.trim();if(!expr.startsWith('='))return expr;
+  let f=expr.slice(1);
+  try{
+    // expand cell refs / ranges
+    f=f.replace(/([A-Z]+\d+):([A-Z]+\d+)/g,(m,a,b)=>{const arr=expandRange(a,b);return'['+arr.map(c=>cellVal(c,cells,seen)).join(',')+']'});
+    f=f.replace(/\b([A-Z]+\d+)\b/g,(m,r)=>cellVal(r,cells,seen));
+    // functions
+    const fns={SUM:a=>a.flat().reduce((s,x)=>s+(+x||0),0),AVG:a=>{const flat=a.flat().map(x=>+x||0);return flat.length?flat.reduce((s,x)=>s+x,0)/flat.length:0},MIN:a=>Math.min(...a.flat().map(x=>+x||0)),MAX:a=>Math.max(...a.flat().map(x=>+x||0)),COUNT:a=>a.flat().filter(x=>x!==''&&!isNaN(+x)).length,COUNTA:a=>a.flat().filter(x=>x!=='').length,IF:(c,a,b)=>c?a:b,ROUND:(x,d)=>{const m=Math.pow(10,d||0);return Math.round((+x||0)*m)/m},ABS:x=>Math.abs(+x||0),SQRT:x=>Math.sqrt(+x||0),CONCAT:(...a)=>a.flat().map(x=>String(x)).join(''),NOW:()=>new Date().toISOString(),TODAY:()=>new Date().toISOString().slice(0,10),LEN:s=>String(s).length,UPPER:s=>String(s).toUpperCase(),LOWER:s=>String(s).toLowerCase()};
+    const sandbox=new Function(...Object.keys(fns),'return '+f);
+    const r=sandbox(...Object.values(fns));
+    if(r===undefined||r===null)return'';
+    if(typeof r==='number'){if(isNaN(r))return'#NUM';if(!isFinite(r))return'#DIV/0';return Math.round(r*1e10)/1e10}
+    return r;
+  }catch(e){return'#ERR'}
+}
+function cellVal(ref,cells,seen){if(seen.has(ref))return 0;seen.add(ref);const v=cells[ref];if(v==null||v==='')return 0;if(v.startsWith('=')){const r=evalFormula(v,cells,seen);return isNaN(+r)?JSON.stringify(String(r)):+r}return isNaN(+v)?JSON.stringify(v):+v}
+function expandRange(a,b){const ma=a.match(/([A-Z]+)(\d+)/),mb=b.match(/([A-Z]+)(\d+)/);if(!ma||!mb)return[];const c1=ma[1].charCodeAt(0),c2=mb[1].charCodeAt(0),r1=+ma[2],r2=+mb[2];const out=[];for(let c=c1;c<=c2;c++)for(let r=r1;r<=r2;r++)out.push(String.fromCharCode(c)+r);return out}
+function newSheet(title,body){const b={id:uid(),title:title||'sheet '+(state.sheets.books.length+1),cells:{},created:now(),updated:now()};if(body){// rough TSV/CSV import from body
+  const rows=body.split('\n').slice(0,SHEET_ROWS);rows.forEach((row,r)=>{const cells=row.split(/[,\t]/).slice(0,SHEET_COLS);cells.forEach((v,c)=>{b.cells[colName(c)+(r+1)]=v.trim()})})}state.sheets.books.push(b);state.sheets.activeId=b.id;state.active='sheets';saveAll();render()}
+function selectSheet(id){state.sheets.activeId=id;state.sheets.activeCell='A1';renderSheetsSide();renderSheetsPane()}
+function deleteSheet(){if(!confirm('delete this sheet?'))return;state.sheets.books=state.sheets.books.filter(x=>x.id!==state.sheets.activeId);state.sheets.activeId=null;saveAll();renderSheetsPane();renderSheetsSide()}
+function exportSheet(fmt){const b=state.sheets.books.find(x=>x.id===state.sheets.activeId);if(!b)return;if(fmt==='json'){downloadFile(slug(b.title)+'.json',JSON.stringify(b,null,2),'application/json');return}let rows=[];for(let r=1;r<=SHEET_ROWS;r++){let row=[],has=false;for(let c=0;c<SHEET_COLS;c++){const v=b.cells[colName(c)+r]||'';const d=v.startsWith('=')?evalFormula(v,b.cells,new Set()):v;if(d!=='')has=true;row.push(String(d).includes(',')?'"'+String(d).replace(/"/g,'""')+'"':d)}if(has)rows.push(row.join(','))}downloadFile(slug(b.title)+'.csv',rows.join('\n'),'text/csv')}
+// ════════════════════════════════════════════════════════════════
+// APP: SLIDES
+// ════════════════════════════════════════════════════════════════
+function viewSlides(){
+  $('#view').innerHTML=`
+    <div class="view">
+      <div class="view-hd"><div><h2>Slides</h2><div class="sub">${state.slides.decks.length} deck${state.slides.decks.length===1?'':'s'}</div></div><div class="actions"><button class="btn primary" onclick="newDeck()">+ new deck</button></div></div>
+      <div class="layout">
+        <aside class="side" id="slidesSide"></aside>
+        <div class="pane" id="slidesPane"></div>
+      </div>
+    </div>`;
+  renderSlidesSide();renderSlidesPane();
+}
+function renderSlidesSide(){
+  const ds=state.slides.decks.slice().sort((a,b)=>b.updated-a.updated);
+  $('#slidesSide').innerHTML=ds.length?ds.map(d=>`<div class="item ${state.slides.activeId===d.id?'active':''}" onclick="selectDeck('${d.id}')"><div>${esc(d.title)}</div><div class="meta">${d.slides.length} slide${d.slides.length===1?'':'s'} · ${fmtDate(d.updated)}</div></div>`).join(''):'<div class="empty">no decks yet</div>';
+}
+function renderSlidesPane(){
+  const d=state.slides.decks.find(x=>x.id===state.slides.activeId);
+  if(!d){$('#slidesPane').innerHTML='<div class="empty"><div class="big">❏</div>select a deck · or create one</div>';return}
+  const idx=Math.min(state.slides.activeIdx,d.slides.length-1);
+  const sl=d.slides[idx];
+  const list=d.slides.map((s,i)=>`<div class="item ${i===idx?'active':''}" onclick="selectSlide(${i})"><div><span class="n" style="display:inline-block">${i+1}</span>${esc(s.title||'untitled')}</div></div>`).join('');
+  const previewBody=sl?sl.body.split('\n').map(l=>l.trim().startsWith('- ')?`<li>${esc(l.trim().slice(2))}</li>`:`<p>${esc(l)}</p>`).join(''):'';
+  const previewHtml=`<h1>${esc(sl?sl.title:'')}</h1><div class="body">${sl&&sl.body.includes('- ')?'<ul>'+previewBody+'</ul>':previewBody}</div>`;
+  $('#slidesPane').innerHTML=`
+    <div class="pane-hd">
+      <input id="dTitle" value="${esc(d.title)}" style="flex:1;min-width:140px;font-family:var(--serif)">
+      <button class="btn sm" onclick="addSlide()">+ slide</button>
+      <button class="btn sm" onclick="exportDeck()">↓ deck.html</button>
+      <button class="btn sm danger" onclick="deleteDeck()">×</button>
+    </div>
+    <div class="pane-bd slide-edit">
+      <div style="display:grid;grid-template-columns:180px 1fr;gap:12px">
+        <div class="slide-list">${list}</div>
+        <div>
+          ${sl?`<div style="display:flex;gap:8px;margin-bottom:8px"><input id="slTitle" value="${esc(sl.title)}" placeholder="slide title" style="flex:1;font-family:var(--serif)"><button class="btn sm danger" onclick="rmSlide(${idx})">remove slide</button></div>
+          <textarea id="slBody" placeholder="slide body · markdown · use - for bullets">${esc(sl.body)}</textarea>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--cream-muted);margin:14px 0 6px;letter-spacing:0.12em;text-transform:uppercase">preview</div>
+          <div class="slide-preview">${previewHtml}</div>`:'<div class="empty">no slides · add one</div>'}
+        </div>
+      </div>
+    </div>`;
+  if(sl){$('#slTitle').oninput=e=>{sl.title=e.target.value;d.updated=now();saveAll();renderSlidesSide();clearTimeout(window._sdv);window._sdv=setTimeout(renderSlidesPane,500)};$('#slBody').oninput=e=>{sl.body=e.target.value;d.updated=now();saveAll();clearTimeout(window._sdv2);window._sdv2=setTimeout(renderSlidesPane,500)}}
+  $('#dTitle').oninput=e=>{d.title=e.target.value;d.updated=now();saveAll();renderSlidesSide()};
+}
+function newDeck(title,body){const d={id:uid(),title:title||'untitled deck',slides:[{title:title||'New deck',body:body||'click to edit'}],created:now(),updated:now()};state.slides.decks.push(d);state.slides.activeId=d.id;state.slides.activeIdx=0;state.active='slides';saveAll();render()}
+function selectDeck(id){state.slides.activeId=id;state.slides.activeIdx=0;renderSlidesSide();renderSlidesPane()}
+function selectSlide(i){state.slides.activeIdx=i;renderSlidesPane()}
+function addSlide(){const d=state.slides.decks.find(x=>x.id===state.slides.activeId);d.slides.push({title:'new slide',body:'click to edit'});state.slides.activeIdx=d.slides.length-1;d.updated=now();saveAll();renderSlidesSide();renderSlidesPane()}
+function rmSlide(i){const d=state.slides.decks.find(x=>x.id===state.slides.activeId);if(d.slides.length<=1){toast('keep at least one slide');return}d.slides.splice(i,1);state.slides.activeIdx=Math.max(0,i-1);d.updated=now();saveAll();renderSlidesPane()}
+function deleteDeck(){if(!confirm('delete this deck?'))return;state.slides.decks=state.slides.decks.filter(x=>x.id!==state.slides.activeId);state.slides.activeId=null;saveAll();renderSlidesPane();renderSlidesSide()}
+// ════════════════════════════════════════════════════════════════
+// APP: MAIL
+// ════════════════════════════════════════════════════════════════
+function viewMail(){
+  $('#view').innerHTML=`
+    <div class="view">
+      <div class="view-hd"><div><h2>Mail</h2><div class="sub">${state.mail.drafts.length} draft${state.mail.drafts.length===1?'':'s'} · compose · send via mailto · export .eml</div></div><div class="actions"><button class="btn primary" onclick="newDraft()">+ new draft</button></div></div>
+      <div class="layout">
+        <aside class="side" id="mailSide"></aside>
+        <div class="pane" id="mailPane"></div>
+      </div>
+    </div>`;
+  renderMailSide();renderMailPane();
+}
+function renderMailSide(){
+  const ds=state.mail.drafts.slice().sort((a,b)=>b.updated-a.updated);
+  $('#mailSide').innerHTML=ds.length?ds.map(d=>`<div class="item ${state.mail.activeId===d.id?'active':''}" onclick="selectDraft('${d.id}')"><div>${esc(d.subject||'(no subject)')}</div><div class="meta">${esc(d.to||'no recipient')} · ${fmtDate(d.updated)}</div></div>`).join(''):'<div class="empty">no drafts yet</div>';
+}
+function renderMailPane(){
+  const d=state.mail.drafts.find(x=>x.id===state.mail.activeId);
+  if(!d){$('#mailPane').innerHTML='<div class="empty"><div class="big">✉</div>select a draft · or create one</div>';return}
+  $('#mailPane').innerHTML=`
+    <div class="pane-hd">
+      <div style="flex:1;font-family:var(--serif);font-size:14px">${esc(d.subject||'(no subject)')}</div>
+      <button class="btn sm primary" onclick="sendMail()">send via mail app</button>
+      <button class="btn sm" onclick="exportEml()">↓ .eml</button>
+      <button class="btn sm danger" onclick="deleteDraft()">×</button>
+    </div>
+    <div class="pane-bd">
+      <div class="mail-field"><label>to</label><input id="mTo" value="${esc(d.to||'')}" placeholder="recipient@example.com"></div>
+      <div class="mail-field"><label>cc</label><input id="mCc" value="${esc(d.cc||'')}"></div>
+      <div class="mail-field"><label>subject</label><input id="mSub" value="${esc(d.subject||'')}"></div>
+      <textarea class="mail-body" id="mBody" placeholder="write your message">${esc(d.body||'')}</textarea>
+    </div>`;
+  const sync=()=>{d.to=$('#mTo').value;d.cc=$('#mCc').value;d.subject=$('#mSub').value;d.body=$('#mBody').value;d.updated=now();clearTimeout(window._mv);window._mv=setTimeout(()=>{saveAll();renderMailSide()},400)};
+  ['#mTo','#mCc','#mSub','#mBody'].forEach(s=>$(s).oninput=sync);
+}
+function newDraft(prefill){const d={id:uid(),to:'',cc:'',subject:'',body:'',...(prefill||{}),created:now(),updated:now()};state.mail.drafts.push(d);state.mail.activeId=d.id;state.active='mail';saveAll();render()}
+function selectDraft(id){state.mail.activeId=id;renderMailSide();renderMailPane()}
+function deleteDraft(){if(!confirm('delete this draft?'))return;state.mail.drafts=state.mail.drafts.filter(x=>x.id!==state.mail.activeId);state.mail.activeId=null;saveAll();renderMailSide();renderMailPane()}
+function sendMail(){const d=state.mail.drafts.find(x=>x.id===state.mail.activeId);if(!d)return;const url='mailto:'+encodeURIComponent(d.to||'')+'?'+(d.cc?'cc='+encodeURIComponent(d.cc)+'&':'')+'subject='+encodeURIComponent(d.subject||'')+'&body='+encodeURIComponent(d.body||'');location.href=url;toast('opened in your mail app')}
+function exportEml(){const d=state.mail.drafts.find(x=>x.id===state.mail.activeId);if(!d)return;const eml=`From: <you@local>\r\nTo: ${d.to||''}\r\n${d.cc?'Cc: '+d.cc+'\r\n':''}Subject: ${d.subject||''}\r\nDate: ${new Date().toUTCString()}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${d.body||''}`;downloadFile(slug(d.subject||'draft')+'.eml',eml,'message/rfc822')}
+// ════════════════════════════════════════════════════════════════
+// APP: CALENDAR
+// ════════════════════════════════════════════════════════════════
+function viewCal(){
+  const d=new Date();if(state.cal.year==null){state.cal.year=d.getFullYear();state.cal.month=d.getMonth()}
+  const y=state.cal.year,m=state.cal.month;
+  const first=new Date(y,m,1),last=new Date(y,m+1,0),start=new Date(first);start.setDate(1-((first.getDay()+6)%7));
+  const cells=[];for(let i=0;i<42;i++){const cd=new Date(start);cd.setDate(start.getDate()+i);cells.push(cd)}
+  const monthName=first.toLocaleString('en-GB',{month:'long',year:'numeric'});
+  const today=new Date();today.setHours(0,0,0,0);
+  const grid=cells.map(cd=>{const isCur=cd.getMonth()===m;const isToday=cd.getTime()===today.getTime();const evs=state.cal.events.filter(e=>{const ed=new Date(e.date);return ed.getFullYear()===cd.getFullYear()&&ed.getMonth()===cd.getMonth()&&ed.getDate()===cd.getDate()});return`<div class="cal-cell ${isCur?'':'other-month'} ${isToday?'today':''}" onclick="openModal('event','${cd.toISOString().slice(0,10)}')"><div class="d">${cd.getDate()}</div>${evs.map(e=>`<div class="ev" title="${esc(e.title)}">${esc(e.time||'')} ${esc(e.title)}</div>`).join('')}</div>`}).join('');
+  $('#view').innerHTML=`
+    <div class="view">
+      <div class="view-hd">
+        <div><h2>Calendar</h2><div class="sub">${state.cal.events.length} event${state.cal.events.length===1?'':'s'} · click a day to add · export ICS</div></div>
+        <div class="actions">
+          <button class="btn sm" onclick="navMonth(-1)">←</button>
+          <div style="font-family:var(--serif);font-size:14px;padding:0 12px;align-self:center">${monthName}</div>
+          <button class="btn sm" onclick="navMonth(1)">→</button>
+          <button class="btn sm" onclick="goToday()">today</button>
+          <button class="btn primary" onclick="openModal('event')">+ event</button>
+          <button class="btn sm" onclick="exportICS()">↓ .ics</button>
+        </div>
+      </div>
+      <div class="cal-header"><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div><div>Sun</div></div>
+      <div class="cal-grid">${grid}</div>
+    </div>`;
+}
+function navMonth(d){state.cal.month+=d;if(state.cal.month<0){state.cal.month=11;state.cal.year--}if(state.cal.month>11){state.cal.month=0;state.cal.year++}saveAll();render()}
+function goToday(){const d=new Date();state.cal.year=d.getFullYear();state.cal.month=d.getMonth();saveAll();render()}
+function exportICS(){const ics=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//FallOffice//EN','CALSCALE:GREGORIAN'];state.cal.events.forEach(e=>{const dt=e.date.replace(/-/g,'');const ts=(e.time||'09:00').replace(':','')+'00';ics.push('BEGIN:VEVENT','UID:'+e.id+'@falloffice','DTSTAMP:'+new Date().toISOString().replace(/[-:.]/g,'').slice(0,15)+'Z','DTSTART:'+dt+'T'+ts,'SUMMARY:'+e.title,(e.notes?'DESCRIPTION:'+e.notes.replace(/\n/g,'\\n'):''),'END:VEVENT')});ics.push('END:VCALENDAR');downloadFile('falloffice-calendar.ics',ics.filter(Boolean).join('\r\n'),'text/calendar')}
+// ════════════════════════════════════════════════════════════════
+// APP: NOTES
+// ════════════════════════════════════════════════════════════════
+function viewNotes(){
+  $('#view').innerHTML=`
+    <div class="view">
+      <div class="view-hd"><div><h2>Notes</h2><div class="sub">${state.notes.notes.length} note${state.notes.notes.length===1?'':'s'} · markdown · tags · search</div></div><div class="actions"><input id="nFilter" placeholder="search…" value="${esc(state.notes.filter)}" style="width:160px"><button class="btn primary" onclick="newNote()">+ new note</button></div></div>
+      <div class="layout">
+        <aside class="side" id="notesSide"></aside>
+        <div class="pane" id="notesPane"></div>
+      </div>
+    </div>`;
+  $('#nFilter').oninput=e=>{state.notes.filter=e.target.value;renderNotesSide()};
+  renderNotesSide();renderNotesPane();
+}
+function renderNotesSide(){
+  const f=(state.notes.filter||'').toLowerCase();
+  const ns=state.notes.notes.filter(n=>!f||(n.title+' '+n.body+' '+(n.tags||'')).toLowerCase().includes(f)).sort((a,b)=>b.updated-a.updated);
+  $('#notesSide').innerHTML=ns.length?ns.map(n=>`<div class="item ${state.notes.activeId===n.id?'active':''}" onclick="selectNote('${n.id}')"><div>${esc(n.title||'untitled')}</div><div class="meta">${esc(n.tags||'(no tags)')} · ${fmtDate(n.updated)}</div></div>`).join(''):'<div class="empty">no notes match</div>';
+}
+function renderNotesPane(){
+  const n=state.notes.notes.find(x=>x.id===state.notes.activeId);
+  if(!n){$('#notesPane').innerHTML='<div class="empty"><div class="big">≡</div>select a note · or create one</div>';return}
+  $('#notesPane').innerHTML=`
+    <div class="pane-hd">
+      <input id="nTitle" value="${esc(n.title)}" placeholder="title" style="flex:1;font-family:var(--serif)">
+      <input id="nTags" value="${esc(n.tags||'')}" placeholder="tags · comma-separated" style="width:200px;font-family:var(--mono);font-size:12px">
+      <button class="btn sm" onclick="exportNote()">↓ .md</button>
+      <button class="btn sm danger" onclick="deleteNote()">×</button>
+    </div>
+    <div class="pane-bd"><textarea id="nBody" style="width:100%;min-height:380px;font-family:var(--mono);font-size:13px;line-height:1.6" placeholder="markdown · # heading · - bullet · ** bold **">${esc(n.body||'')}</textarea></div>`;
+  const sync=()=>{n.title=$('#nTitle').value;n.tags=$('#nTags').value;n.body=$('#nBody').value;n.updated=now();clearTimeout(window._nv);window._nv=setTimeout(()=>{saveAll();renderNotesSide()},400)};
+  ['#nTitle','#nTags','#nBody'].forEach(s=>$(s).oninput=sync);
+}
+function newNote(p){const n={id:uid(),title:'',tags:'',body:'',...(p||{}),created:now(),updated:now()};state.notes.notes.push(n);state.notes.activeId=n.id;state.active='notes';saveAll();render()}
+function selectNote(id){state.notes.activeId=id;renderNotesPane()}
+function deleteNote(){if(!confirm('delete this note?'))return;state.notes.notes=state.notes.notes.filter(x=>x.id!==state.notes.activeId);state.notes.activeId=null;saveAll();renderNotesSide();renderNotesPane()}
+function exportNote(){const n=state.notes.notes.find(x=>x.id===state.notes.activeId);if(!n)return;const md=`# ${n.title||'untitled'}\n\n${n.tags?'tags: '+n.tags+'\n\n':''}${n.body||''}`;downloadFile(slug(n.title||'note')+'.md',md,'text/markdown')}
+// ════════════════════════════════════════════════════════════════
+// APP: TASKS
+// ════════════════════════════════════════════════════════════════
+function viewTasks(){
+  const counts={all:state.tasks.tasks.length,open:state.tasks.tasks.filter(t=>!t.done).length,done:state.tasks.tasks.filter(t=>t.done).length};
+  $('#view').innerHTML=`
+    <div class="view">
+      <div class="view-hd"><div><h2>Tasks</h2><div class="sub">${counts.open} open · ${counts.done} done · ${counts.all} total</div></div>
+      <div class="actions">
+        <button class="btn sm ${state.tasks.filter==='all'?'primary':''}" onclick="state.tasks.filter='all';viewTasks()">all</button>
+        <button class="btn sm ${state.tasks.filter==='open'?'primary':''}" onclick="state.tasks.filter='open';viewTasks()">open</button>
+        <button class="btn sm ${state.tasks.filter==='done'?'primary':''}" onclick="state.tasks.filter='done';viewTasks()">done</button>
+        <button class="btn primary" onclick="openModal('task')">+ new task</button>
+        <button class="btn sm" onclick="exportTasks()">↓ .md</button>
+      </div></div>
+      <div id="taskList"></div>
+    </div>`;
+  renderTaskList();
+}
+function renderTaskList(){
+  let ts=state.tasks.tasks;
+  if(state.tasks.filter==='open')ts=ts.filter(t=>!t.done);
+  if(state.tasks.filter==='done')ts=ts.filter(t=>t.done);
+  ts=ts.sort((a,b)=>(a.done-b.done)||(a.priority-b.priority)||((a.due||'9999')<(b.due||'9999')?-1:1));
+  $('#taskList').innerHTML=ts.length?ts.map(t=>`<div class="task-card p${t.priority||3} ${t.done?'done':''}"><input type="checkbox" ${t.done?'checked':''} onchange="toggleTask('${t.id}')"><div><div class="title">${esc(t.title)}</div>${t.project||t.due?`<div class="meta">${t.project?'#'+esc(t.project):''} ${t.due?'· due '+esc(t.due):''}</div>`:''}</div><div><button class="btn sm danger" onclick="rmTask('${t.id}')">×</button></div></div>`).join(''):'<div class="empty">no tasks</div>';
+}
+function addTask(p){const t={id:uid(),title:'',priority:3,due:'',project:'',done:false,...(p||{}),created:now()};state.tasks.tasks.push(t);state.active='tasks';saveAll();render()}
+function toggleTask(id){const t=state.tasks.tasks.find(x=>x.id===id);t.done=!t.done;t.updated=now();saveAll();renderTaskList()}
+function rmTask(id){state.tasks.tasks=state.tasks.tasks.filter(x=>x.id!==id);saveAll();viewTasks()}
+function exportTasks(){const ts=state.tasks.tasks.map(t=>`- [${t.done?'x':' '}] ${t.title}${t.project?' #'+t.project:''}${t.due?' (due '+t.due+')':''}${t.priority<3?' [p'+t.priority+']':''}`).join('\n');downloadFile('tasks-'+new Date().toISOString().slice(0,10)+'.md','# Tasks\n\n'+ts,'text/markdown')}
+// ════════════════════════════════════════════════════════════════
+// MODALS
+// ════════════════════════════════════════════════════════════════
+function openModal(kind,arg){
+  if(kind==='settings'){
+    $('#modalTitle').textContent='Settings · cascade keys';
+    $('#modalBody').innerHTML=`
+      <div class="field"><label>consultant rate tier (used by other estate tools)</label><select id="stRate"><option value="low" ${state.settings.rateTier==='low'?'selected':''}>low</option><option value="mid" ${state.settings.rateTier==='mid'?'selected':''}>mid</option><option value="high" ${state.settings.rateTier==='high'?'selected':''}>high</option><option value="luxury" ${state.settings.rateTier==='luxury'?'selected':''}>luxury</option></select></div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--brass);letter-spacing:0.12em;text-transform:uppercase;margin:14px 0 8px">autopilot keys · any one unlocks T3</div>
+      <p style="color:var(--cream-dim);font-size:12px;margin-bottom:10px"><a href="https://aistudio.google.com/apikey" target="_blank">Gemini is free</a>. Keys stay in this browser. Sent direct to provider.</p>
+      <div class="field"><label>anthropic · claude</label><input id="stAnth" type="password" value="${esc(state.settings.anthropicKey)}" placeholder="sk-ant-…"></div>
+      <div class="field"><label>gemini · free</label><input id="stGem" type="password" value="${esc(state.settings.geminiKey)}"></div>
+      <div class="field"><label>openai · gpt</label><input id="stOAI" type="password" value="${esc(state.settings.openaiKey)}"></div>
+      <div class="field"><label>openrouter</label><input id="stOR" type="password" value="${esc(state.settings.openrouterKey)}"></div>
+      <div class="actions"><button class="btn" onclick="closeModal()">cancel</button><button class="btn primary" onclick="saveSettings()">save</button><button class="btn" onclick="exportAll()">↓ export everything</button><button class="btn danger" onclick="importAll()">↑ import</button></div>`;
+  }else if(kind==='event'){
+    const date=arg||new Date().toISOString().slice(0,10);
+    $('#modalTitle').textContent='New event';
+    $('#modalBody').innerHTML=`
+      <div class="field"><label>title</label><input id="eTitle" placeholder="e.g. Coffee with Mansoor"></div>
+      <div class="field"><label>date</label><input id="eDate" type="date" value="${date}"></div>
+      <div class="field"><label>time</label><input id="eTime" type="time" value="09:00"></div>
+      <div class="field"><label>notes</label><textarea id="eNotes" style="min-height:80px"></textarea></div>
+      <div class="actions"><button class="btn" onclick="closeModal()">cancel</button><button class="btn primary" onclick="saveEvent()">save</button></div>`;
+    setTimeout(()=>$('#eTitle').focus(),50);
+  }else if(kind==='task'){
+    $('#modalTitle').textContent='New task';
+    $('#modalBody').innerHTML=`
+      <div class="field"><label>title</label><input id="tTitle" placeholder="what needs doing"></div>
+      <div class="field"><label>project (tag)</label><input id="tProj" placeholder="optional"></div>
+      <div class="field"><label>due</label><input id="tDue" type="date"></div>
+      <div class="field"><label>priority</label><select id="tPri"><option value="1">P1 · urgent</option><option value="2">P2 · soon</option><option value="3" selected>P3 · normal</option></select></div>
+      <div class="actions"><button class="btn" onclick="closeModal()">cancel</button><button class="btn primary" onclick="saveTask()">save</button></div>`;
+    setTimeout(()=>$('#tTitle').focus(),50);
+  }
+  $('#modal').classList.add('open');
+}
+function closeModal(){$('#modal').classList.remove('open')}
+function saveSettings(){state.settings.rateTier=$('#stRate').value;state.settings.anthropicKey=$('#stAnth').value;state.settings.geminiKey=$('#stGem').value;state.settings.openaiKey=$('#stOAI').value;state.settings.openrouterKey=$('#stOR').value;Cascade._p=undefined;saveAll();updateTierBadge();closeModal();toast('settings saved')}
+function saveEvent(){const e={id:uid(),title:$('#eTitle').value.trim(),date:$('#eDate').value,time:$('#eTime').value,notes:$('#eNotes').value,created:now()};if(!e.title){toast('title required');return}state.cal.events.push(e);saveAll();closeModal();toast('event added');render()}
+function saveTask(){const t={id:uid(),title:$('#tTitle').value.trim(),project:$('#tProj').value,due:$('#tDue').value,priority:+$('#tPri').value,done:false,created:now()};if(!t.title){toast('title required');return}state.tasks.tasks.push(t);saveAll();closeModal();toast('task added');viewTasks()}
+// ── export / import all ──
+function exportAll(){downloadFile('falloffice-export-'+new Date().toISOString().slice(0,10)+'.json',JSON.stringify({schema:'falloffice@'+VERSION,exported:new Date().toISOString(),state},null,2),'application/json');toast('exported')}
+function importAll(){const i=document.createElement('input');i.type='file';i.accept='.json';i.onchange=async e=>{const f=e.target.files[0];if(!f)return;const text=await f.text();try{const d=JSON.parse(text);if(d.state&&confirm('replace ALL local data with import?')){state=Object.assign({},getDefaults(),d.state);state.active='words';await saveAll();closeModal();render();toast('imported')}}catch(err){alert('invalid import: '+err.message)}};i.click()}
+// ── util ──
+function downloadFile(name,content,mime){const blob=new Blob([content],{type:mime});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+function slug(s){return String(s||'untitled').toLowerCase().replace(/[^a-z0-9-]+/g,'-').replace(/^-+|-+$/g,'').slice(0,50)||'untitled'}
+// ════════════════════════════════════════════════════════════════
+// RENDER
+// ════════════════════════════════════════════════════════════════
+function showApp(name){state.active=name;saveAll();render()}
+function render(){
+  $('#appNav').innerHTML=APPS.map(a=>`<button class="${state.active===a.id?'active':''}" onclick="showApp('${a.id}')"><span class="ico">${a.ico}</span>${a.name}</button>`).join('');
+  ({words:viewWords,sheets:viewSheets,slides:viewSlides,mail:viewMail,cal:viewCal,notes:viewNotes,tasks:viewTasks})[state.active]();
+}
+// ── keyboard ──
+document.addEventListener('keydown',e=>{
+  if((e.ctrlKey||e.metaKey)&&e.key==='k'){e.preventDefault();openPalette()}
+  if(e.key==='Escape'){closePalette();closeModal()}
+  if($('#palette').classList.contains('open')){
+    if(e.key==='Enter'){e.preventDefault();executeIntent()}
+  }
+});
+document.addEventListener('input',e=>{if(e.target.id==='pInput')renderPaletteSuggestions(e.target.value)});
+document.addEventListener('click',e=>{if(e.target.id==='palette')closePalette();if(e.target.id==='modal')closeModal()});
+// ── KONOMI · sovereign tier (inert per doctrine §12) ──
+// ── FALLMESH ──
+try{const sig=new BroadcastChannel('fall-signal');sig.postMessage({source:'falloffice',type:'hello',prime:PRIME,version:VERSION,ts:Date.now()});sig.addEventListener('message',e=>{const m=e.data;if(m&&m.type==='ping')sig.postMessage({source:'falloffice',type:'pong',prime:PRIME})})}catch(e){}
+// ── postMessage API ──
+// ── boot ──
+(async function(){await openDB();await loadAll();await updateTierBadge();if(!state.active||!APPS.find(a=>a.id===state.active))state.active='words';render();})();
+
+// Named exports for the primary API surface
+export { loadConfig };
+export { saveConfig };
+export { $ };
+export { esc };
+export { aiTier };
+export { renderAiChip };
+export { loadWebLLM };
+export { aiComplete };
+export { aiCloudCall };
+export { meshStart };
+
+export { FALL_KIT_VERSION };
+export { KCC_MINT_URL };
+export { WEBLLM_MODELS };
+export { DEFAULT_MODEL };
+export { T3_PROVIDERS };
+export { STATE };
+export { MESH_CHANNEL };
+export { STUN_SERVERS };
+export { VERSION };
+export { APPS };

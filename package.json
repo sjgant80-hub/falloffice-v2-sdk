@@ -1,0 +1,24 @@
+{
+  "name": "@ai-native-solutions/falloffice-v2-sdk",
+  "version": "1.0.0",
+  "description": "falloffice-v2 SDK · sovereign single-file library extracted from falloffice-v2/index.html",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "files": ["src", "docs", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node --test test/",
+    "smoke": "node examples/smoke.js"
+  },
+  "keywords": ["falloffice-v2", "sdk", "sovereign", "ai-native-solutions"],
+  "author": "AI-Native Solutions",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sjgant80-hub/falloffice-v2-sdk.git"
+  },
+  "homepage": "https://sjgant80-hub.github.io/falloffice-v2-sdk/",
+  "publishConfig": {
+    "access": "public"
+  }
+}
